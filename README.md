@@ -1,4 +1,4 @@
-# MSA-5-PaymentService
+# MSA-4-PaymentService
 
 Проектная работа спринта 4: архитектура Saga-оркестрации обработки платежа для компании OrchestrPay.
 
