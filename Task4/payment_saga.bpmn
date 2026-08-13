@@ -1,0 +1,527 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_PaymentSaga"
+                  targetNamespace="http://orchestrpay.com/bpmn"
+                  exporter="Camunda Modeler"
+                  exporterVersion="5.0.0">
+
+  <bpmn:error id="Error_DebitFailed" name="DebitFailed" errorCode="DEBIT_FAILED" />
+
+  <bpmn:process id="payment-saga" name="OrchestrPay — обработка платежа (Saga)" isExecutable="true" camunda:historyTimeToLive="30">
+
+    <!-- ==================== Старт ==================== -->
+    <bpmn:startEvent id="StartEvent_PaymentInitiated" name="Платёж инициирован">
+      <bpmn:outgoing>Flow_Start_Create</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <!-- ==================== CREATE_PAYMENT ==================== -->
+    <bpmn:serviceTask id="Task_CreatePayment" name="CREATE_PAYMENT&#10;Регистрация платежа"
+                      camunda:type="external" camunda:topic="create-payment">
+      <bpmn:incoming>Flow_Start_Create</bpmn:incoming>
+      <bpmn:outgoing>Flow_Create_Debit</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:boundaryEvent id="Boundary_CompensateCreate" attachedToRef="Task_CreatePayment">
+      <bpmn:compensateEventDefinition id="CompensateDef_Create" />
+    </bpmn:boundaryEvent>
+
+    <bpmn:serviceTask id="Task_CancelPayment" name="CANCEL_PAYMENT&#10;Отмена платежа"
+                      isForCompensation="true"
+                      camunda:type="external" camunda:topic="cancel-payment" />
+
+    <!-- ==================== DEBIT_ACCOUNT ==================== -->
+    <bpmn:serviceTask id="Task_DebitAccount" name="DEBIT_ACCOUNT&#10;Списание со счёта клиента"
+                      camunda:type="external" camunda:topic="debit-account">
+      <bpmn:incoming>Flow_Create_Debit</bpmn:incoming>
+      <bpmn:outgoing>Flow_Debit_Split</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:boundaryEvent id="Boundary_CompensateDebit" attachedToRef="Task_DebitAccount">
+      <bpmn:compensateEventDefinition id="CompensateDef_Debit" />
+    </bpmn:boundaryEvent>
+
+    <bpmn:serviceTask id="Task_RefundToCustomer" name="REFUND_TO_CUSTOMER&#10;Возврат средств клиенту"
+                      isForCompensation="true"
+                      camunda:type="external" camunda:topic="refund-customer" />
+
+    <bpmn:boundaryEvent id="Boundary_DebitFailed" name="Списание не прошло" attachedToRef="Task_DebitAccount">
+      <bpmn:outgoing>Flow_DebitFailed_Notify</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorDef_DebitFailed" errorRef="Error_DebitFailed" />
+    </bpmn:boundaryEvent>
+
+    <bpmn:serviceTask id="Task_NotifyClientRejected" name="SEND_NOTIFICATION_CLIENT&#10;Платёж отклонён"
+                      camunda:type="external" camunda:topic="notify-client">
+      <bpmn:extensionElements>
+        <camunda:inputOutput>
+          <camunda:inputParameter name="notificationType">PAYMENT_REJECTED</camunda:inputParameter>
+        </camunda:inputOutput>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_DebitFailed_Notify</bpmn:incoming>
+      <bpmn:outgoing>Flow_Notify_EndRejected</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="EndEvent_Rejected" name="REJECTED">
+      <bpmn:incoming>Flow_Notify_EndRejected</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- ==================== ANTIFRAUD_CHECK: параллельные проверки ==================== -->
+    <bpmn:parallelGateway id="Gateway_ChecksSplit" name="Параллельные проверки">
+      <bpmn:incoming>Flow_Debit_Split</bpmn:incoming>
+      <bpmn:outgoing>Flow_Split_FraudRules</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Split_Aml</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Split_GeoRisk</bpmn:outgoing>
+    </bpmn:parallelGateway>
+
+    <bpmn:serviceTask id="Task_FraudRules" name="Внутренние правила&#10;FraudCheck Service"
+                      camunda:type="external" camunda:topic="fraud-rules">
+      <bpmn:incoming>Flow_Split_FraudRules</bpmn:incoming>
+      <bpmn:outgoing>Flow_FraudRules_Join</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:serviceTask id="Task_AmlCheck" name="Внешняя проверка AML"
+                      camunda:type="external" camunda:topic="aml-check">
+      <bpmn:incoming>Flow_Split_Aml</bpmn:incoming>
+      <bpmn:outgoing>Flow_Aml_Join</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:serviceTask id="Task_GeoRiskCheck" name="Внешняя проверка GeoRisk"
+                      camunda:type="external" camunda:topic="georisk-check">
+      <bpmn:incoming>Flow_Split_GeoRisk</bpmn:incoming>
+      <bpmn:outgoing>Flow_GeoRisk_Join</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:parallelGateway id="Gateway_ChecksJoin">
+      <bpmn:incoming>Flow_FraudRules_Join</bpmn:incoming>
+      <bpmn:incoming>Flow_Aml_Join</bpmn:incoming>
+      <bpmn:incoming>Flow_GeoRisk_Join</bpmn:incoming>
+      <bpmn:outgoing>Flow_Join_Resolve</bpmn:outgoing>
+    </bpmn:parallelGateway>
+
+    <bpmn:serviceTask id="Task_ResolveDecision" name="ANTIFRAUD_CHECK&#10;Сведение решения"
+                      camunda:type="external" camunda:topic="resolve-decision">
+      <bpmn:incoming>Flow_Join_Resolve</bpmn:incoming>
+      <bpmn:outgoing>Flow_Resolve_ManualNeeded</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <!-- ==================== Развилка: нужна ли ручная проверка ==================== -->
+    <bpmn:exclusiveGateway id="Gateway_ManualNeeded" name="Нужна ручная проверка?" default="Flow_SkipManualReview">
+      <bpmn:incoming>Flow_Resolve_ManualNeeded</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToManualReview</bpmn:outgoing>
+      <bpmn:outgoing>Flow_SkipManualReview</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:userTask id="UserTask_ManualReview" name="MANUAL_REVIEW&#10;Ручная проверка оператором"
+                   camunda:candidateGroups="antifraud-operators">
+      <bpmn:extensionElements>
+        <camunda:formData>
+          <camunda:formField id="manualDecision" label="Решение оператора" type="enum">
+            <camunda:value id="ALLOW" name="Разрешить транзакцию" />
+            <camunda:value id="DENY" name="Запретить транзакцию" />
+          </camunda:formField>
+          <camunda:formField id="reviewComment" label="Комментарий" type="string" />
+        </camunda:formData>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_ToManualReview</bpmn:incoming>
+      <bpmn:outgoing>Flow_Manual_Apply</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:boundaryEvent id="Boundary_CutOff" name="Cut-off 20 мин" attachedToRef="UserTask_ManualReview"
+                        cancelActivity="true">
+      <bpmn:outgoing>Flow_CutOff_Apply</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="TimerDef_CutOff">
+        <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">${cutOffDuration}</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+
+    <bpmn:serviceTask id="Task_ApplyManualDecision" name="Применить решение оператора"
+                      camunda:type="external" camunda:topic="apply-manual-decision">
+      <bpmn:incoming>Flow_Manual_Apply</bpmn:incoming>
+      <bpmn:outgoing>Flow_ApplyManual_Done</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:serviceTask id="Task_ApplyCutOff" name="Применить cut-off&#10;по умолчанию: ALLOW"
+                      camunda:type="external" camunda:topic="apply-cutoff">
+      <bpmn:incoming>Flow_CutOff_Apply</bpmn:incoming>
+      <bpmn:outgoing>Flow_ApplyCutOff_Done</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:exclusiveGateway id="Gateway_ManualDone">
+      <bpmn:incoming>Flow_ApplyManual_Done</bpmn:incoming>
+      <bpmn:incoming>Flow_ApplyCutOff_Done</bpmn:incoming>
+      <bpmn:outgoing>Flow_ManualDone_Final</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <!-- ==================== Развилка: итоговое решение ==================== -->
+    <bpmn:exclusiveGateway id="Gateway_FinalRoute" name="Решение антифрода" default="Flow_Deny_NotifySecurity">
+      <bpmn:incoming>Flow_SkipManualReview</bpmn:incoming>
+      <bpmn:incoming>Flow_ManualDone_Final</bpmn:incoming>
+      <bpmn:outgoing>Flow_Allow_Transfer</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Deny_NotifySecurity</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <!-- ==================== Успешный путь ==================== -->
+    <bpmn:serviceTask id="Task_TransferToMerchant" name="TRANSFER_TO_MERCHANT&#10;Перевод контрагенту — PIVOT"
+                      camunda:type="external" camunda:topic="transfer-to-merchant">
+      <bpmn:incoming>Flow_Allow_Transfer</bpmn:incoming>
+      <bpmn:outgoing>Flow_Transfer_Result</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:exclusiveGateway id="Gateway_TransferResult" name="Перевод выполнен?" default="Flow_TransferFailed_Compensate">
+      <bpmn:incoming>Flow_Transfer_Result</bpmn:incoming>
+      <bpmn:outgoing>Flow_TransferOk_Notify</bpmn:outgoing>
+      <bpmn:outgoing>Flow_TransferFailed_Compensate</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:serviceTask id="Task_NotifyClientSuccess" name="SEND_NOTIFICATION_CLIENT&#10;Платёж проведён"
+                      camunda:type="external" camunda:topic="notify-client">
+      <bpmn:extensionElements>
+        <camunda:inputOutput>
+          <camunda:inputParameter name="notificationType">PAYMENT_COMPLETED</camunda:inputParameter>
+        </camunda:inputOutput>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_TransferOk_Notify</bpmn:incoming>
+      <bpmn:outgoing>Flow_Notify_EndCompleted</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="EndEvent_Completed" name="COMPLETED">
+      <bpmn:incoming>Flow_Notify_EndCompleted</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- ==================== Компенсационный путь ==================== -->
+    <bpmn:serviceTask id="Task_NotifySecurity" name="NOTIFY_SECURITY&#10;Уведомление безопасности"
+                      camunda:type="external" camunda:topic="notify-security">
+      <bpmn:incoming>Flow_Deny_NotifySecurity</bpmn:incoming>
+      <bpmn:outgoing>Flow_NotifySecurity_Compensate</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:intermediateThrowEvent id="Throw_Compensation" name="Запуск компенсаций">
+      <bpmn:incoming>Flow_NotifySecurity_Compensate</bpmn:incoming>
+      <bpmn:incoming>Flow_TransferFailed_Compensate</bpmn:incoming>
+      <bpmn:outgoing>Flow_Compensate_NotifyRefund</bpmn:outgoing>
+      <bpmn:compensateEventDefinition id="CompensateThrowDef" />
+    </bpmn:intermediateThrowEvent>
+
+    <bpmn:serviceTask id="Task_NotifyClientRefund" name="SEND_NOTIFICATION_CLIENT&#10;Средства возвращены"
+                      camunda:type="external" camunda:topic="notify-client">
+      <bpmn:extensionElements>
+        <camunda:inputOutput>
+          <camunda:inputParameter name="notificationType">PAYMENT_REFUNDED</camunda:inputParameter>
+        </camunda:inputOutput>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Compensate_NotifyRefund</bpmn:incoming>
+      <bpmn:outgoing>Flow_NotifyRefund_EndRefunded</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="EndEvent_Refunded" name="REFUNDED">
+      <bpmn:incoming>Flow_NotifyRefund_EndRefunded</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- ==================== Потоки ==================== -->
+    <bpmn:sequenceFlow id="Flow_Start_Create" sourceRef="StartEvent_PaymentInitiated" targetRef="Task_CreatePayment" />
+    <bpmn:sequenceFlow id="Flow_Create_Debit" sourceRef="Task_CreatePayment" targetRef="Task_DebitAccount" />
+    <bpmn:sequenceFlow id="Flow_Debit_Split" sourceRef="Task_DebitAccount" targetRef="Gateway_ChecksSplit" />
+
+    <bpmn:sequenceFlow id="Flow_DebitFailed_Notify" sourceRef="Boundary_DebitFailed" targetRef="Task_NotifyClientRejected" />
+    <bpmn:sequenceFlow id="Flow_Notify_EndRejected" sourceRef="Task_NotifyClientRejected" targetRef="EndEvent_Rejected" />
+
+    <bpmn:sequenceFlow id="Flow_Split_FraudRules" sourceRef="Gateway_ChecksSplit" targetRef="Task_FraudRules" />
+    <bpmn:sequenceFlow id="Flow_Split_Aml" sourceRef="Gateway_ChecksSplit" targetRef="Task_AmlCheck" />
+    <bpmn:sequenceFlow id="Flow_Split_GeoRisk" sourceRef="Gateway_ChecksSplit" targetRef="Task_GeoRiskCheck" />
+    <bpmn:sequenceFlow id="Flow_FraudRules_Join" sourceRef="Task_FraudRules" targetRef="Gateway_ChecksJoin" />
+    <bpmn:sequenceFlow id="Flow_Aml_Join" sourceRef="Task_AmlCheck" targetRef="Gateway_ChecksJoin" />
+    <bpmn:sequenceFlow id="Flow_GeoRisk_Join" sourceRef="Task_GeoRiskCheck" targetRef="Gateway_ChecksJoin" />
+    <bpmn:sequenceFlow id="Flow_Join_Resolve" sourceRef="Gateway_ChecksJoin" targetRef="Task_ResolveDecision" />
+    <bpmn:sequenceFlow id="Flow_Resolve_ManualNeeded" sourceRef="Task_ResolveDecision" targetRef="Gateway_ManualNeeded" />
+
+    <bpmn:sequenceFlow id="Flow_ToManualReview" name="MANUAL_REVIEW" sourceRef="Gateway_ManualNeeded" targetRef="UserTask_ManualReview">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${decision == 'MANUAL_REVIEW'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_SkipManualReview" name="решение получено сразу" sourceRef="Gateway_ManualNeeded" targetRef="Gateway_FinalRoute" />
+
+    <bpmn:sequenceFlow id="Flow_Manual_Apply" sourceRef="UserTask_ManualReview" targetRef="Task_ApplyManualDecision" />
+    <bpmn:sequenceFlow id="Flow_CutOff_Apply" sourceRef="Boundary_CutOff" targetRef="Task_ApplyCutOff" />
+    <bpmn:sequenceFlow id="Flow_ApplyManual_Done" sourceRef="Task_ApplyManualDecision" targetRef="Gateway_ManualDone" />
+    <bpmn:sequenceFlow id="Flow_ApplyCutOff_Done" sourceRef="Task_ApplyCutOff" targetRef="Gateway_ManualDone" />
+    <bpmn:sequenceFlow id="Flow_ManualDone_Final" sourceRef="Gateway_ManualDone" targetRef="Gateway_FinalRoute" />
+
+    <bpmn:sequenceFlow id="Flow_Allow_Transfer" name="ALLOW" sourceRef="Gateway_FinalRoute" targetRef="Task_TransferToMerchant">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${decision == 'ALLOW'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_Deny_NotifySecurity" name="DENY" sourceRef="Gateway_FinalRoute" targetRef="Task_NotifySecurity" />
+
+    <bpmn:sequenceFlow id="Flow_Transfer_Result" sourceRef="Task_TransferToMerchant" targetRef="Gateway_TransferResult" />
+    <bpmn:sequenceFlow id="Flow_TransferOk_Notify" name="успех" sourceRef="Gateway_TransferResult" targetRef="Task_NotifyClientSuccess">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${transferSucceeded}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_TransferFailed_Compensate" name="сбой перевода" sourceRef="Gateway_TransferResult" targetRef="Throw_Compensation" />
+    <bpmn:sequenceFlow id="Flow_Notify_EndCompleted" sourceRef="Task_NotifyClientSuccess" targetRef="EndEvent_Completed" />
+
+    <bpmn:sequenceFlow id="Flow_NotifySecurity_Compensate" sourceRef="Task_NotifySecurity" targetRef="Throw_Compensation" />
+    <bpmn:sequenceFlow id="Flow_Compensate_NotifyRefund" sourceRef="Throw_Compensation" targetRef="Task_NotifyClientRefund" />
+    <bpmn:sequenceFlow id="Flow_NotifyRefund_EndRefunded" sourceRef="Task_NotifyClientRefund" targetRef="EndEvent_Refunded" />
+
+    <!-- Артефакты идут после всех flow-элементов — того требует BPMN XSD -->
+    <bpmn:association id="Assoc_CompensateCreate" associationDirection="One"
+                      sourceRef="Boundary_CompensateCreate" targetRef="Task_CancelPayment" />
+    <bpmn:association id="Assoc_CompensateDebit" associationDirection="One"
+                      sourceRef="Boundary_CompensateDebit" targetRef="Task_RefundToCustomer" />
+
+  </bpmn:process>
+
+  <!-- ==================== Диаграмма ==================== -->
+  <bpmndi:BPMNDiagram id="BPMNDiagram_PaymentSaga">
+    <bpmndi:BPMNPlane id="BPMNPlane_PaymentSaga" bpmnElement="payment-saga">
+
+      <bpmndi:BPMNShape id="Shape_StartEvent" bpmnElement="StartEvent_PaymentInitiated">
+        <dc:Bounds x="152" y="337" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="130" y="380" width="80" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_CreatePayment" bpmnElement="Task_CreatePayment">
+        <dc:Bounds x="240" y="310" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_BoundaryCompensateCreate" bpmnElement="Boundary_CompensateCreate">
+        <dc:Bounds x="312" y="382" width="36" height="36" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_CancelPayment" bpmnElement="Task_CancelPayment">
+        <dc:Bounds x="240" y="610" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_DebitAccount" bpmnElement="Task_DebitAccount">
+        <dc:Bounds x="490" y="310" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_BoundaryCompensateDebit" bpmnElement="Boundary_CompensateDebit">
+        <dc:Bounds x="562" y="382" width="36" height="36" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_RefundToCustomer" bpmnElement="Task_RefundToCustomer">
+        <dc:Bounds x="490" y="610" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_BoundaryDebitFailed" bpmnElement="Boundary_DebitFailed">
+        <dc:Bounds x="522" y="292" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="560" y="286" width="82" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_NotifyClientRejected" bpmnElement="Task_NotifyClientRejected">
+        <dc:Bounds x="450" y="170" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_EndRejected" bpmnElement="EndEvent_Rejected">
+        <dc:Bounds x="690" y="197" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="678" y="240" width="61" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ChecksSplit" bpmnElement="Gateway_ChecksSplit">
+        <dc:Bounds x="750" y="330" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="736" y="387" width="79" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_FraudRules" bpmnElement="Task_FraudRules">
+        <dc:Bounds x="860" y="170" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_AmlCheck" bpmnElement="Task_AmlCheck">
+        <dc:Bounds x="860" y="310" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_GeoRiskCheck" bpmnElement="Task_GeoRiskCheck">
+        <dc:Bounds x="860" y="450" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ChecksJoin" bpmnElement="Gateway_ChecksJoin">
+        <dc:Bounds x="1120" y="330" width="50" height="50" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ResolveDecision" bpmnElement="Task_ResolveDecision">
+        <dc:Bounds x="1230" y="310" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ManualNeeded" bpmnElement="Gateway_ManualNeeded" isMarkerVisible="true">
+        <dc:Bounds x="1490" y="330" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1476" y="277" width="79" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ManualReview" bpmnElement="UserTask_ManualReview">
+        <dc:Bounds x="1560" y="610" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_BoundaryCutOff" bpmnElement="Boundary_CutOff">
+        <dc:Bounds x="1632" y="682" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1497" y="723" width="78" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ApplyManualDecision" bpmnElement="Task_ApplyManualDecision">
+        <dc:Bounds x="1780" y="610" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ApplyCutOff" bpmnElement="Task_ApplyCutOff">
+        <dc:Bounds x="1780" y="760" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ManualDone" bpmnElement="Gateway_ManualDone" isMarkerVisible="true">
+        <dc:Bounds x="1990" y="630" width="50" height="50" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_FinalRoute" bpmnElement="Gateway_FinalRoute" isMarkerVisible="true">
+        <dc:Bounds x="1990" y="330" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1977" y="387" width="77" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_NotifySecurity" bpmnElement="Task_NotifySecurity">
+        <dc:Bounds x="2100" y="170" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_TransferToMerchant" bpmnElement="Task_TransferToMerchant">
+        <dc:Bounds x="2100" y="310" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_ThrowCompensation" bpmnElement="Throw_Compensation">
+        <dc:Bounds x="2357" y="197" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2337" y="146" width="77" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_TransferResult" bpmnElement="Gateway_TransferResult" isMarkerVisible="true">
+        <dc:Bounds x="2350" y="330" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2337" y="387" width="77" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_NotifyClientRefund" bpmnElement="Task_NotifyClientRefund">
+        <dc:Bounds x="2440" y="170" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_NotifyClientSuccess" bpmnElement="Task_NotifyClientSuccess">
+        <dc:Bounds x="2460" y="310" width="180" height="90" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_EndRefunded" bpmnElement="EndEvent_Refunded">
+        <dc:Bounds x="2700" y="197" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2688" y="240" width="61" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Shape_EndCompleted" bpmnElement="EndEvent_Completed">
+        <dc:Bounds x="2710" y="337" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2696" y="380" width="66" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+
+      <!-- ============ Потоки ============ -->
+      <bpmndi:BPMNEdge id="Edge_Start_Create" bpmnElement="Flow_Start_Create">
+        <di:waypoint x="188" y="355" /><di:waypoint x="240" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Create_Debit" bpmnElement="Flow_Create_Debit">
+        <di:waypoint x="420" y="355" /><di:waypoint x="490" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Debit_Split" bpmnElement="Flow_Debit_Split">
+        <di:waypoint x="670" y="355" /><di:waypoint x="750" y="355" />
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_DebitFailed_Notify" bpmnElement="Flow_DebitFailed_Notify">
+        <di:waypoint x="540" y="292" /><di:waypoint x="540" y="260" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Notify_EndRejected" bpmnElement="Flow_Notify_EndRejected">
+        <di:waypoint x="630" y="215" /><di:waypoint x="690" y="215" />
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_Split_FraudRules" bpmnElement="Flow_Split_FraudRules">
+        <di:waypoint x="775" y="330" /><di:waypoint x="775" y="215" /><di:waypoint x="860" y="215" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Split_Aml" bpmnElement="Flow_Split_Aml">
+        <di:waypoint x="800" y="355" /><di:waypoint x="860" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Split_GeoRisk" bpmnElement="Flow_Split_GeoRisk">
+        <di:waypoint x="775" y="380" /><di:waypoint x="775" y="495" /><di:waypoint x="860" y="495" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_FraudRules_Join" bpmnElement="Flow_FraudRules_Join">
+        <di:waypoint x="1040" y="215" /><di:waypoint x="1145" y="215" /><di:waypoint x="1145" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Aml_Join" bpmnElement="Flow_Aml_Join">
+        <di:waypoint x="1040" y="355" /><di:waypoint x="1120" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_GeoRisk_Join" bpmnElement="Flow_GeoRisk_Join">
+        <di:waypoint x="1040" y="495" /><di:waypoint x="1145" y="495" /><di:waypoint x="1145" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Join_Resolve" bpmnElement="Flow_Join_Resolve">
+        <di:waypoint x="1170" y="355" /><di:waypoint x="1230" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Resolve_ManualNeeded" bpmnElement="Flow_Resolve_ManualNeeded">
+        <di:waypoint x="1410" y="355" /><di:waypoint x="1490" y="355" />
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_ToManualReview" bpmnElement="Flow_ToManualReview">
+        <di:waypoint x="1515" y="380" /><di:waypoint x="1515" y="655" /><di:waypoint x="1560" y="655" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1400" y="600" width="90" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_SkipManualReview" bpmnElement="Flow_SkipManualReview">
+        <di:waypoint x="1540" y="355" /><di:waypoint x="1990" y="355" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1700" y="327" width="140" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_Manual_Apply" bpmnElement="Flow_Manual_Apply">
+        <di:waypoint x="1740" y="655" /><di:waypoint x="1780" y="655" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_CutOff_Apply" bpmnElement="Flow_CutOff_Apply">
+        <di:waypoint x="1650" y="718" /><di:waypoint x="1650" y="805" /><di:waypoint x="1780" y="805" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ApplyManual_Done" bpmnElement="Flow_ApplyManual_Done">
+        <di:waypoint x="1960" y="655" /><di:waypoint x="1990" y="655" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ApplyCutOff_Done" bpmnElement="Flow_ApplyCutOff_Done">
+        <di:waypoint x="1960" y="805" /><di:waypoint x="2015" y="805" /><di:waypoint x="2015" y="680" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ManualDone_Final" bpmnElement="Flow_ManualDone_Final">
+        <di:waypoint x="2015" y="630" /><di:waypoint x="2015" y="380" />
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_Allow_Transfer" bpmnElement="Flow_Allow_Transfer">
+        <di:waypoint x="2040" y="355" /><di:waypoint x="2100" y="355" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2048" y="327" width="45" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Deny_NotifySecurity" bpmnElement="Flow_Deny_NotifySecurity">
+        <di:waypoint x="2015" y="330" /><di:waypoint x="2015" y="215" /><di:waypoint x="2100" y="215" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2024" y="250" width="40" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_Transfer_Result" bpmnElement="Flow_Transfer_Result">
+        <di:waypoint x="2280" y="355" /><di:waypoint x="2350" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_TransferOk_Notify" bpmnElement="Flow_TransferOk_Notify">
+        <di:waypoint x="2400" y="355" /><di:waypoint x="2460" y="355" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2408" y="327" width="45" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_TransferFailed_Compensate" bpmnElement="Flow_TransferFailed_Compensate">
+        <di:waypoint x="2375" y="330" /><di:waypoint x="2375" y="233" />
+        <bpmndi:BPMNLabel><dc:Bounds x="2385" y="268" width="90" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Notify_EndCompleted" bpmnElement="Flow_Notify_EndCompleted">
+        <di:waypoint x="2640" y="355" /><di:waypoint x="2710" y="355" />
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="Edge_NotifySecurity_Compensate" bpmnElement="Flow_NotifySecurity_Compensate">
+        <di:waypoint x="2280" y="215" /><di:waypoint x="2357" y="215" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Compensate_NotifyRefund" bpmnElement="Flow_Compensate_NotifyRefund">
+        <di:waypoint x="2393" y="215" /><di:waypoint x="2440" y="215" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_NotifyRefund_EndRefunded" bpmnElement="Flow_NotifyRefund_EndRefunded">
+        <di:waypoint x="2620" y="215" /><di:waypoint x="2700" y="215" />
+      </bpmndi:BPMNEdge>
+
+      <!-- ============ Ассоциации компенсаций ============ -->
+      <bpmndi:BPMNEdge id="Edge_AssocCompensateCreate" bpmnElement="Assoc_CompensateCreate">
+        <di:waypoint x="330" y="418" /><di:waypoint x="330" y="610" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_AssocCompensateDebit" bpmnElement="Assoc_CompensateDebit">
+        <di:waypoint x="580" y="418" /><di:waypoint x="580" y="610" />
+      </bpmndi:BPMNEdge>
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
